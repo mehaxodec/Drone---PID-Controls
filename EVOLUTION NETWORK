@@ -1,0 +1,164 @@
+import numpy as np
+import random
+import pid
+from math import e, exp
+from pid import DroneSimulator, PID, run
+import os
+
+class RBFNetwork:
+    def __init__(self, neuron_number=16, input_size=15):
+        limit = 1 / np.sqrt(neuron_number)
+        self.centers = np.random.uniform(-5, 5, (neuron_number, input_size))
+        self.betas = np.random.uniform(0.1, 1.0, neuron_number)
+        self.W2 = np.random.uniform(-limit, limit, (neuron_number, 12))
+        self.b2 = np.zeros(12)
+
+    def raw_output(self, x):
+        hidden = []
+        for i in range(len(self.betas)):
+            diff = x - self.centers[i]
+            hidden.append(np.exp(-self.betas[i] * np.sum(diff**2)))
+        hidden = np.array(hidden)
+        return hidden @ self.W2 + self.b2
+
+    def pack_output(self, output):
+        output = np.abs(output) * 5
+        kp = np.clip(output[0::3], 0.1, 5.0)
+        ki = np.clip(output[1::3], 0.0, 2.0)
+        kd = np.clip(output[2::3], 0.0, 10.0)
+        return [kp[0],ki[0],kd[0]], [kp[1],ki[1],kd[1]], [kp[2],ki[2],kd[2]], [kp[3],ki[3],kd[3]]
+
+    def forward(self, x):
+        return self.pack_output(self.raw_output(x))
+
+    def get_action(self, x):
+        sigma = 0.3
+        mean = self.raw_output(x)
+        noise = np.random.randn(12) * sigma
+        action = mean + noise 
+        self.last_noise = noise
+        self.last_mean  = mean
+        self.last_x     = x
+        return self.pack_output(action)    
+    
+
+    def update(self, reward, learning_rate=0.01):
+        hidden = np.array([np.exp(-self.betas[i] * np.sum((self.last_x - self.centers[i])**2)) for i in range(len(self.betas))])
+
+        grad_W2 = np.outer(hidden, self.last_noise) * reward 
+        grad_b2 = self.last_noise * reward
+        self.W2 += learning_rate * grad_W2
+        self.b2 += learning_rate * grad_b2
+
+    def evaluate_single_scenario(self, set_alt, set_pitch, set_roll, set_yaw, loop, dt):
+        drone = DroneSimulator(mass=0.5, k=0.1962, dt=dt)
+
+        # PID by NN
+        pid_alt_nn = PID(1.5, 0.1, 0.8, dt)               
+        pid_pitch_nn = PID(2.0, 0.1, 0.5, dt)              
+        pid_roll_nn = PID(2.0, 0.1, 0.5, dt)               
+        pid_yaw_nn = PID(1.0, 0.0, 0.3, dt, is_angle=True)  
+
+        # Fix PID
+        pid_alt_fixed = PID(1.5, 0.1, 0.8, dt)           
+        pid_pitch_fixed = PID(2.0, 0.1, 0.5, dt)          
+        pid_roll_fixed = PID(2.0, 0.1, 0.5, dt)           
+        pid_yaw_fixed = PID(1.0, 0.0, 0.3, dt, is_angle=True)  
+
+        M_UR = M_UL = M_DR = M_DL = 0.0
+        e_alt = e_pitch = e_roll = e_yaw = [0.0, 0.0, 0.0]
+
+        total_error = 0.0
+        steps_taken = 0
+        stable_steps = 0
+        fitness = 0
+
+        # threshold
+        threshold_alt   = 0.1  # 10cm
+        threshold_pitch = 1.0  # 1 dgr
+        threshold_roll  = 1.0
+        threshold_yaw   = 2.0
+
+        for i in range(loop):
+            steps_taken += 1
+            
+            k_alt, k_pitch, k_roll, k_yaw = self.get_action(np.array(e_alt + e_pitch + e_roll + e_yaw + [pid_alt_nn.integral, pid_pitch_nn.integral, pid_roll_nn.integral], dtype=float))
+
+            M_UR, M_UL, M_DR, M_DL, e_alt, e_pitch, e_roll, e_yaw, Check_pass_thrs, gammas = run(
+                drone,
+                pid_alt_nn, pid_pitch_nn, pid_roll_nn, pid_yaw_nn,
+                pid_alt_fixed, pid_pitch_fixed, pid_roll_fixed, pid_yaw_fixed,
+                set_alt, set_pitch, set_roll, set_yaw,
+                k_alt, k_pitch, k_roll, k_yaw,
+                M_UR, M_UL, M_DR, M_DL, dt
+            )
+
+            # S error
+            step_err = (e_alt[0]**2) * 2.0 + (e_pitch[0]**2 / 10) + (e_roll[0]**2  / 10) + (e_yaw[0]**2   / 20) + (e_alt[2]**2)  * 0.5
+            total_error += step_err
+
+            if Check_pass_thrs:
+                fitness -= 10
+
+            # stay
+            if (e_alt[0] < threshold_alt and e_pitch[0] < threshold_pitch and
+                e_roll[0] < threshold_roll and e_yaw[0] < threshold_yaw):
+                stable_steps += 1
+            else:
+                stable_steps = 0
+
+            if stable_steps >= 40:
+                break
+
+        # Fitness
+        fitness -= (total_error / steps_taken)
+
+        if stable_steps >= 40:
+            time_bonus    = (loop - steps_taken) * 10.0 
+            quality_bonus = stable_steps * 5.0 
+            fitness += time_bonus + quality_bonus
+
+        return fitness
+
+    def evaluate(self, scenarios, loop, dt):
+        total_fitness = 0.0
+        for (set_alt, set_pitch, set_roll, set_yaw) in scenarios:
+            total_fitness += self.evaluate_single_scenario(set_alt, set_pitch, set_roll, set_yaw, loop, dt)
+        return total_fitness / len(scenarios)
+
+    
+
+
+    def load(self, path_centers, path_betas, path_W2, path_b2):
+        self.centers = np.load(path_centers)
+        self.betas   = np.load(path_betas)
+        self.W2      = np.load(path_W2)
+        self.b2      = np.load(path_b2)
+        
+
+# ------------------ Training --------------------- #
+if __name__ == "__main__":
+    dt = 0.05
+    best_reward = -999999999
+    nn = RBFNetwork()
+    loop = 300
+
+    for episode in range(1000):
+        scenarios = [
+            (random.uniform(0.5, 10.0), 0.0, 0.0, 0.0),
+            (random.uniform(0.5, 10.0), random.uniform(-30, 30), random.uniform(-30, 30), 0),
+            (3.0, random.uniform(-45, 45), random.uniform(-45, 45), random.uniform(0, 360))
+        ]
+
+        reward = nn.evaluate(scenarios, loop, dt)
+        nn.update(reward)
+
+        if reward > best_reward:
+            best_reward = reward
+            SAVE_DIR = os.path.dirname(os.path.abspath(__file__))
+            np.save(os.path.join(SAVE_DIR, "best_centers.npy"), nn.centers)
+            np.save(os.path.join(SAVE_DIR, "best_betas.npy"),   nn.betas)
+            np.save(os.path.join(SAVE_DIR, "best_W2.npy"),      nn.W2)
+            np.save(os.path.join(SAVE_DIR, "best_b2.npy"),      nn.b2)
+
+        print(f"Episode {episode} | reward={reward:.2f} | best={best_reward:.2f}")
