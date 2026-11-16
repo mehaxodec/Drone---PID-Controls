@@ -1,0 +1,239 @@
+import time
+import random
+import numpy as np
+
+class PID:
+    def __init__(self, kp, ki, kd, dt, is_angle=False):
+        self.kp       = kp
+        self.ki       = ki
+        self.kd       = kd
+        self.dt       = dt
+        self.is_angle = is_angle
+        self.integral   = 0.0
+        self.prev_error = 0.0
+
+    def update(self, setpoint, measurement):
+        error = setpoint - measurement
+
+        if self.is_angle:
+            error = (error + 180) % 360 - 180
+
+        # P
+        p_out = self.kp * error
+
+        # I
+        if (self.prev_error * error < 0) and (abs(error) > 0.01):
+            self.integral = 0
+        self.integral += error * self.dt
+        i_out = self.ki * self.integral
+
+        # D
+        derivative      = (error - self.prev_error) / self.dt
+        d_out           = self.kd * derivative
+        self.prev_error = error
+
+        # Avoid I windup
+        output_raw     = p_out + i_out + d_out
+        output_clamped = max(-100.0, min(100.0, output_raw))
+        self.integral -= (output_raw - output_clamped) * self.dt
+
+        return output_clamped, [abs(error), abs(self.integral), abs(derivative)]
+
+
+class DroneSimulator:
+    def __init__(self, mass, k, dt):
+        self.state = {'alt': 0.0, 'pitch': 0.0, 'roll': 0.0, 'yaw': 0.0}
+        self.vel   = {'alt': 0.0, 'pitch': 0.0, 'roll': 0.0, 'yaw': 0.0}
+        self.ac    = {'alt': 0.0, 'pitch': 0.0, 'roll': 0.0, 'yaw': 0.0}
+        self.wind  = {'alt': 0.0, 'pitch': 0.0, 'roll': 0.0, 'yaw': 0.0}
+        self.wind_timer = random.uniform(0.5, 1.5)
+        self.mass = mass
+        self.k    = k
+        self.dt   = dt
+        self.DAMPING_YAW = 0.95
+
+    def reset(self):
+        self.state = {'alt': 0.0, 'pitch': 0.0, 'roll': 0.0, 'yaw': 0.0}
+        self.vel   = {'alt': 0.0, 'pitch': 0.0, 'roll': 0.0, 'yaw': 0.0}
+        self.ac    = {'alt': 0.0, 'pitch': 0.0, 'roll': 0.0, 'yaw': 0.0}
+        self.wind  = {'alt': 0.0, 'pitch': 0.0, 'roll': 0.0, 'yaw': 0.0}
+        self.wind_timer = random.uniform(0.5, 1.5)
+
+    def update_wind(self):
+        self.wind_timer -= self.dt
+        if self.wind_timer <= 0:
+            theta = 0.1 
+            sigma = 0.3
+            mean  = 0.0
+            for i in (['pitch', 'roll', 'yaw', 'alt']):
+                self.wind[i] += theta * (mean - self.wind[i]) * self.dt + sigma * np.random.randn() * np.sqrt(self.dt)
+
+            for key in self.wind:
+                self.wind[key] = max(-2.0, min(2.0, self.wind[key]))
+
+    def simulate(self, droneUR, droneUL, droneDR, droneDL):
+        self.update_wind()
+        Lift        = (droneUR + droneUL + droneDR + droneDL) * self.k / 4
+        Pitch_Force = (droneDR + droneDL - droneUR - droneUL) * self.k
+        Roll_Force  = (droneUR + droneDR - droneDL - droneUL) * self.k
+        Yaw_Force   = (droneUR + droneDL - droneUL - droneDR) * self.k
+
+        Pitch_Force += self.wind['pitch']
+        Roll_Force  += self.wind['roll']
+        Yaw_Force   += self.wind['yaw']
+        Lift        += self.wind['alt']
+
+        Force      = [Lift, Pitch_Force, Roll_Force, Yaw_Force]
+        Parameters = ['alt', 'pitch', 'roll', 'yaw']
+
+        for i in range(4):
+            if i == 0:
+                self.ac[Parameters[i]] = Force[i] / self.mass - 9.81
+            else:
+                self.ac[Parameters[i]] = Force[i] / self.mass
+
+            if Parameters[i] == 'yaw':
+                self.vel['yaw'] *= self.DAMPING_YAW
+
+            self.vel[Parameters[i]]   += self.ac[Parameters[i]] * self.dt
+            self.state[Parameters[i]] += self.vel[Parameters[i]] * self.dt
+
+            if Parameters[i] in ['pitch', 'roll', 'yaw']:
+                self.state[Parameters[i]] = (self.state[Parameters[i]] + 180) % 360 - 180
+
+            if Parameters[i] == 'alt' and self.state['alt'] < 0:
+                self.state['alt']  = 0.0
+                self.vel['alt']    = 0.0
+
+        return self.state
+
+
+def mixer(out_alt, out_pitch, out_roll, out_yaw):
+    M_UR = max(0, min(100, out_alt - out_pitch + out_roll + out_yaw))
+    M_UL = max(0, min(100, out_alt - out_pitch - out_roll - out_yaw))
+    M_DR = max(0, min(100, out_alt + out_pitch + out_roll - out_yaw))
+    M_DL = max(0, min(100, out_alt + out_pitch - out_roll + out_yaw))
+    return M_UR, M_UL, M_DR, M_DL
+
+
+def axis_modulator(error, threshold_safe, threshold_danger):  # 1
+    if error < threshold_safe:  # 1
+        return 1.0  # 1
+    elif error > threshold_danger:  # 1
+        return 0.0  # 1
+    else:  # 1
+        mid   = (threshold_safe + threshold_danger) / 2  # 1
+        scale = 10 / (threshold_danger - threshold_safe)  # 1
+        return 1 / (1 + np.exp((error - mid) * scale))  # 1
+
+
+def modulator(e_alt, e_pitch, e_roll, e_yaw, set_alt):  # 1
+    gamma_alt   = axis_modulator(e_alt,   threshold_safe=max(0.1, abs(set_alt) * 0.1),
+                                            threshold_danger=max(0.5, abs(set_alt) * 0.5))  # 1
+    gamma_pitch = axis_modulator(e_pitch, threshold_safe=3.0,  threshold_danger=20.0)  # 1
+    gamma_roll  = axis_modulator(e_roll,  threshold_safe=3.0,  threshold_danger=20.0)  # 1
+    gamma_yaw   = axis_modulator(e_yaw,   threshold_safe=5.0,  threshold_danger=30.0)  # 1
+    return gamma_alt, gamma_pitch, gamma_roll, gamma_yaw  # 1
+
+
+def run(drone,
+        pid_alt_nn, pid_pitch_nn, pid_roll_nn, pid_yaw_nn,                # 1
+        pid_alt_fixed, pid_pitch_fixed, pid_roll_fixed, pid_yaw_fixed,    # 1
+        set_alt, set_pitch, set_roll, set_yaw,
+        k_alt, k_pit, k_rol, k_yaw, M_UR, M_UL, M_DR, M_DL, dt):
+
+    Check_pass_thrs = False
+
+    set_pitch = max(-45.0, min(45.0, set_pitch))
+    set_roll  = max(-45.0, min(45.0, set_roll))
+    set_yaw   = (set_yaw + 180) % 360 - 180
+
+    # Gan he so tu NN cho bo PID "nn" -- bo "fixed" giu nguyen he so an toan  # 1
+    pid_alt_nn.kp,   pid_alt_nn.ki,   pid_alt_nn.kd   = k_alt[0], k_alt[1], k_alt[2]   # 1
+    pid_pitch_nn.kp, pid_pitch_nn.ki, pid_pitch_nn.kd = k_pit[0], k_pit[1], k_pit[2]   # 1
+    pid_roll_nn.kp,  pid_roll_nn.ki,  pid_roll_nn.kd  = k_rol[0], k_rol[1], k_rol[2]   # 1
+    pid_yaw_nn.kp,   pid_yaw_nn.ki,   pid_yaw_nn.kd   = k_yaw[0], k_yaw[1], k_yaw[2]   # 1
+
+    HOVER = (drone.mass * 9.81) / drone.k
+
+    state = drone.simulate(M_UR, M_UL, M_DR, M_DL)
+
+    # Output cua bo NN -- error tra ve dung de NN.forward() o buoc sau  # 1
+    adj_alt_nn,   e_alt   = pid_alt_nn.update(set_alt,     state["alt"])    # 1
+    adj_pitch_nn, e_pitch = pid_pitch_nn.update(set_pitch, state["pitch"])  # 1
+    adj_roll_nn,  e_roll  = pid_roll_nn.update(set_roll,   state["roll"])   # 1
+    adj_yaw_nn,   e_yaw   = pid_yaw_nn.update(set_yaw,     state["yaw"])    # 1
+
+    # Output cua bo PID co dinh (an toan) -- chay song song doc lap  # 1
+    adj_alt_fixed,   _ = pid_alt_fixed.update(set_alt,     state["alt"])    # 1
+    adj_pitch_fixed, _ = pid_pitch_fixed.update(set_pitch, state["pitch"])  # 1
+    adj_roll_fixed,  _ = pid_roll_fixed.update(set_roll,   state["roll"])   # 1
+    adj_yaw_fixed,   _ = pid_yaw_fixed.update(set_yaw,     state["yaw"])    # 1
+
+    # Modulator -- tinh gamma rieng tung truc roi tron 2 nguon output  # 1
+    g_alt, g_pitch, g_roll, g_yaw = modulator(e_alt[0], e_pitch[0], e_roll[0], e_yaw[0], set_alt)  # 1
+
+    pid_alt_adj = g_alt   * adj_alt_nn   + (1 - g_alt)   * adj_alt_fixed     # 1
+    pid_pit_adj = g_pitch * adj_pitch_nn + (1 - g_pitch) * adj_pitch_fixed   # 1
+    pid_rol_adj = g_roll  * adj_roll_nn  + (1 - g_roll)  * adj_roll_fixed    # 1
+    pid_yaw_adj = g_yaw   * adj_yaw_nn   + (1 - g_yaw)   * adj_yaw_fixed     # 1
+
+    if (abs(state["alt"]) > abs(set_alt) or
+    abs(state["pitch"]) > abs(set_pitch) or
+    abs(state["roll"]) > abs(set_roll) or
+    abs(state["yaw"]) > abs(set_yaw)):
+        Check_pass_thrs = True
+
+    out_alt   = max(0.0, min(100.0, HOVER + pid_alt_adj))
+    out_pitch = pid_pit_adj * 0.1
+    out_roll  = pid_rol_adj * 0.1
+    out_yaw   = pid_yaw_adj * 0.1
+
+    M_UR, M_UL, M_DR, M_DL = mixer(out_alt, out_pitch, out_roll, out_yaw)
+
+    return (M_UR, M_UL, M_DR, M_DL, e_alt, e_pitch, e_roll, e_yaw,
+            Check_pass_thrs, (g_alt, g_pitch, g_roll, g_yaw))  # 1
+
+
+# ------------------ Programm --------------------- #
+if __name__ == "__main__":
+    set_alt = float(input())
+    set_pitch = float(input())
+    set_roll = float(input())
+    set_yaw = float(input())
+    loop = int(input())
+    dt = 0.05
+
+    k_alt = [0.5, 0.0, 2.0]
+    k_pit = [2.0, 0.0, 2.0]
+    k_rol = [2.0, 0.0, 2.0]
+    k_yaw = [2.0, 0.0, 2.0]
+
+    drone = DroneSimulator(mass=0.5, k=0.1962, dt=dt)
+
+    # Khong co AI o day -- tao 2 bo PID giong het nhau de gamma khong anh huong gi  # 1
+    pid_alt_nn   = PID(k_alt[0], k_alt[1], k_alt[2], dt)                 # 1
+    pid_pitch_nn = PID(k_pit[0], k_pit[1], k_pit[2], dt)                 # 1
+    pid_roll_nn  = PID(k_rol[0], k_rol[1], k_rol[2], dt)                 # 1
+    pid_yaw_nn   = PID(k_yaw[0], k_yaw[1], k_yaw[2], dt, is_angle=True)  # 1
+
+    pid_alt_fixed   = PID(k_alt[0], k_alt[1], k_alt[2], dt)                 # 1
+    pid_pitch_fixed = PID(k_pit[0], k_pit[1], k_pit[2], dt)                 # 1
+    pid_roll_fixed  = PID(k_rol[0], k_rol[1], k_rol[2], dt)                 # 1
+    pid_yaw_fixed   = PID(k_yaw[0], k_yaw[1], k_yaw[2], dt, is_angle=True)  # 1
+
+    M_UR = M_UL = M_DR = M_DL = 0.0
+
+    for i in range(loop):
+        M_UR, M_UL, M_DR, M_DL, e_alt, e_pitch, e_roll, e_yaw, vuot_nguong, gammas = run(  # 1
+            drone,
+            pid_alt_nn, pid_pitch_nn, pid_roll_nn, pid_yaw_nn,                # 1
+            pid_alt_fixed, pid_pitch_fixed, pid_roll_fixed, pid_yaw_fixed,    # 1
+            set_alt, set_pitch, set_roll, set_yaw,
+            k_alt, k_pit, k_rol, k_yaw,
+            M_UR, M_UL, M_DR, M_DL, dt
+        )
+        if vuot_nguong:
+            break
+        print(f"alt={drone.state['alt']:.2f}m | pitch={drone.state['pitch']:.2f}° | "f"roll={drone.state['roll']:.2f}° | yaw={drone.state['yaw']:.2f}°")
+        time.sleep(dt)
