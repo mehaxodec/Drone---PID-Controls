@@ -1,0 +1,231 @@
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from Evolution import RBFNetwork
+from pid import DroneSimulator, PID, run
+
+# ── Load AI ───────────────────────────────────────────────────────────────────
+import os
+SAVE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+nn = RBFNetwork()
+nn.load(
+    os.path.join(SAVE_DIR, "best_centers.npy"),
+    os.path.join(SAVE_DIR, "best_betas.npy"),
+    os.path.join(SAVE_DIR, "best_W2.npy"),
+    os.path.join(SAVE_DIR, "best_b2.npy"),
+)
+
+set_alt   = float(input("Altitude (m): "))
+set_pitch = float(input("Pitch (°): "))
+set_roll  = float(input("Roll (°): "))
+set_yaw   = float(input("Yaw (°): "))
+dt        = 0.05
+
+# ── Khởi tạo drone & PID ─────────────────────────────────────────────────────
+drone = DroneSimulator(mass=0.5, k=0.1962, dt=dt)
+
+pid_alt_nn      = PID(1.5, 0.1, 0.8, dt)
+pid_pitch_nn    = PID(2.0, 0.1, 0.5, dt)
+pid_roll_nn     = PID(2.0, 0.1, 0.5, dt)
+pid_yaw_nn      = PID(1.0, 0.0, 0.3, dt, is_angle=True)
+pid_alt_fixed   = PID(1.5, 0.1, 0.8, dt)
+pid_pitch_fixed = PID(2.0, 0.1, 0.5, dt)
+pid_roll_fixed  = PID(2.0, 0.1, 0.5, dt)
+pid_yaw_fixed   = PID(1.0, 0.0, 0.3, dt, is_angle=True)
+
+M_UR = M_UL = M_DR = M_DL = 0.0
+e_alt = e_pitch = e_roll = e_yaw = [0.0, 0.0, 0.0]
+
+# ── Buffer toàn bộ lịch sử (không giới hạn) ──────────────────────────────────
+t_data     = []
+alt_data   = []
+pitch_data = []
+roll_data  = []
+yaw_data   = []
+mur_data   = []
+mul_data   = []
+mdr_data   = []
+mdl_data   = []
+t_now      = 0.0
+
+# ── Figure ───────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(5, 1, figsize=(11, 10), sharex=False)
+fig.suptitle("Drone — Real-time Monitor  (hover để xem tọa độ)", fontsize=12)
+fig.tight_layout(pad=2.8)
+
+ax_alt, ax_pitch, ax_roll, ax_yaw, ax_motor = axes
+
+COLORS = {
+    'alt':   '#378ADD',
+    'pitch': '#1D9E75',
+    'roll':  '#BA7517',
+    'yaw':   '#9B59B6',
+    'mur':   '#378ADD',
+    'mul':   '#1D9E75',
+    'mdr':   '#E24B4A',
+    'mdl':   '#9B59B6',
+}
+
+def setup_state_ax(ax, label, color, unit):
+    ax.set_ylabel(f"{label} ({unit})", fontsize=9)
+    ax.tick_params(labelsize=8)
+    ax.grid(True, alpha=0.25)
+    line,    = ax.plot([], [], color=color, lw=1.6, label=label)
+    setline, = ax.plot([], [], color=color, lw=1.0, ls='--', alpha=0.45, label='setpoint')
+    ax.legend(fontsize=7, loc='upper right')
+    return line, setline
+
+line_alt,   sl_alt   = setup_state_ax(ax_alt,   'Altitude', COLORS['alt'],   'm')
+line_pitch, sl_pitch = setup_state_ax(ax_pitch, 'Pitch',    COLORS['pitch'], '°')
+line_roll,  sl_roll  = setup_state_ax(ax_roll,  'Roll',     COLORS['roll'],  '°')
+line_yaw,   sl_yaw   = setup_state_ax(ax_yaw,   'Yaw',      COLORS['yaw'],   '°')
+
+ax_motor.set_ylabel('Motor speed (%)', fontsize=9)
+ax_motor.tick_params(labelsize=8)
+ax_motor.grid(True, alpha=0.25)
+ax_motor.set_ylim(-5, 105)
+lm_ur, = ax_motor.plot([], [], color=COLORS['mur'], lw=1.2, label='M_UR front-left')
+lm_ul, = ax_motor.plot([], [], color=COLORS['mul'], lw=1.2, label='M_UL front-right')
+lm_dr, = ax_motor.plot([], [], color=COLORS['mdr'], lw=1.2, label='M_DR rear-left')
+lm_dl, = ax_motor.plot([], [], color=COLORS['mdl'], lw=1.2, label='M_DL rear-right')
+ax_motor.legend(fontsize=7, loc='upper right')
+
+# ── Tooltip: vertical crosshair + annotation trên từng subplot ───────────────
+vlines   = [ax.axvline(x=0, color='gray', lw=0.8, ls=':', visible=False) for ax in axes]
+annots   = []
+for ax in axes:
+    ann = ax.annotate(
+        '', xy=(0, 0), xytext=(10, 10),
+        textcoords='offset points',
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='gray', alpha=0.85),
+        fontsize=8, visible=False
+    )
+    annots.append(ann)
+
+# Map từng subplot → data và label đơn vị
+subplot_data = [
+    (alt_data,   'm'),
+    (pitch_data, '°'),
+    (roll_data,  '°'),
+    (yaw_data,   '°'),
+    (None,       '%'),   # motor — xử lý riêng
+]
+
+def on_move(event):
+    if event.xdata is None:
+        for vl in vlines:
+            vl.set_visible(False)
+        for ann in annots:
+            ann.set_visible(False)
+        fig.canvas.draw_idle()
+        return
+
+    tx = event.xdata
+    if not t_data:
+        return
+
+    # Tìm index gần nhất theo thời gian
+    t_arr = np.array(t_data)
+    idx = int(np.argmin(np.abs(t_arr - tx)))
+
+    for i, (ax, vl, ann) in enumerate(zip(axes, vlines, annots)):
+        if event.inaxes == ax:
+            vl.set_xdata([tx, tx])
+            vl.set_visible(True)
+
+            if i < 4:
+                data, unit = subplot_data[i]
+                if idx < len(data):
+                    yval = data[idx]
+                    ann.xy = (t_data[idx], yval)
+                    ann.set_text(f"t={t_data[idx]:.2f}s\n{yval:.3f}{unit}")
+                    ann.set_visible(True)
+            else:
+                # Motor subplot — hiện cả 4 motor
+                if idx < len(mur_data):
+                    ann.xy = (t_data[idx], mur_data[idx])
+                    ann.set_text(
+                        f"t={t_data[idx]:.2f}s\n"
+                        f"UR={mur_data[idx]:.1f}%\n"
+                        f"UL={mul_data[idx]:.1f}%\n"
+                        f"DR={mdr_data[idx]:.1f}%\n"
+                        f"DL={mdl_data[idx]:.1f}%"
+                    )
+                    ann.set_visible(True)
+        else:
+            vl.set_visible(False)
+            ann.set_visible(False)
+
+    fig.canvas.draw_idle()
+
+fig.canvas.mpl_connect('motion_notify_event', on_move)
+
+# ── Update frame ──────────────────────────────────────────────────────────────
+def update_frame(_):
+    global M_UR, M_UL, M_DR, M_DL, e_alt, e_pitch, e_roll, e_yaw, t_now
+
+    k_alt, k_pitch, k_roll, k_yaw = nn.forward(
+        np.array(e_alt + e_pitch + e_roll + e_yaw +
+                 [pid_alt_nn.integral, pid_pitch_nn.integral, pid_roll_nn.integral],
+                 dtype=float))
+
+    M_UR, M_UL, M_DR, M_DL, e_alt, e_pitch, e_roll, e_yaw, _, gammas = run(
+        drone,
+        pid_alt_nn, pid_pitch_nn, pid_roll_nn, pid_yaw_nn,
+        pid_alt_fixed, pid_pitch_fixed, pid_roll_fixed, pid_yaw_fixed,
+        set_alt, set_pitch, set_roll, set_yaw,
+        k_alt, k_pitch, k_roll, k_yaw,
+        M_UR, M_UL, M_DR, M_DL, dt
+    )
+
+    t_now += dt
+    t_data.append(t_now)
+    alt_data.append(drone.state['alt'])
+    pitch_data.append(drone.state['pitch'])
+    roll_data.append(drone.state['roll'])
+    yaw_data.append(drone.state['yaw'])
+    mur_data.append(M_UR)
+    mul_data.append(M_UL)
+    mdr_data.append(M_DR)
+    mdl_data.append(M_DL)
+
+    if len(t_data) < 2:
+        return (line_alt, sl_alt, line_pitch, sl_pitch,
+                line_roll, sl_roll, line_yaw, sl_yaw,
+                lm_ur, lm_ul, lm_dr, lm_dl)
+
+    t = t_data
+
+    def refresh_state(line, setline, data, setval, ax):
+        line.set_data(t, data)
+        setline.set_data([t[0], t[-1]], [setval, setval])
+        ax.set_xlim(t[0], t[-1] + 0.5)
+        pad = max(abs(setval) * 0.15, 0.5)
+        lo  = min(min(data), setval) - pad
+        hi  = max(max(data), setval) + pad
+        ax.set_ylim(lo, hi)
+
+    refresh_state(line_alt,   sl_alt,   alt_data,   set_alt,   ax_alt)
+    refresh_state(line_pitch, sl_pitch, pitch_data, set_pitch, ax_pitch)
+    refresh_state(line_roll,  sl_roll,  roll_data,  set_roll,  ax_roll)
+    refresh_state(line_yaw,   sl_yaw,   yaw_data,   set_yaw,   ax_yaw)
+
+    for lm, data in [(lm_ur, mur_data), (lm_ul, mul_data),
+                     (lm_dr, mdr_data), (lm_dl, mdl_data)]:
+        lm.set_data(t, data)
+    ax_motor.set_xlim(t[0], t[-1] + 0.5)
+
+    return (line_alt, sl_alt, line_pitch, sl_pitch,
+            line_roll, sl_roll, line_yaw, sl_yaw,
+            lm_ur, lm_ul, lm_dr, lm_dl)
+
+# ── Chạy ─────────────────────────────────────────────────────────────────────
+ani = animation.FuncAnimation(
+    fig, update_frame,
+    interval=int(dt * 1000),
+    blit=True, cache_frame_data=False
+)
+
+plt.show()
